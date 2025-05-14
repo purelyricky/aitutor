@@ -1,3 +1,5 @@
+// Fix for ActionSynchronizer.ts to properly handle timing of whiteboard actions
+
 import React from 'react';
 
 // Types for synchronized actions
@@ -35,13 +37,16 @@ export class ActionSynchronizer {
   private processingAction: boolean = false;
   private lastActionTime: number = 0;
   private actionBuffer: string[] = [];
+  private debugMode: boolean = false;
 
   constructor(
     actionCallback: (action: string) => void,
-    onComplete: () => void
+    onComplete: () => void,
+    debugMode: boolean = false
   ) {
     this.actionCallback = actionCallback;
     this.onComplete = onComplete;
+    this.debugMode = debugMode;
   }
 
   /**
@@ -51,6 +56,10 @@ export class ActionSynchronizer {
    * [00:10] Let's start with an example {draw:rectangle}
    */
   parseResponse(response: string): ParsedResponse {
+    if (this.debugMode) {
+      console.log("Parsing response:", response);
+    }
+    
     const lines = response.split('\n');
     const actions: Action[] = [];
     const speech: SpeechSegment[] = [];
@@ -58,6 +67,9 @@ export class ActionSynchronizer {
     let previousTimestamp = 0;
 
     lines.forEach((line) => {
+      // Skip empty lines
+      if (!line.trim()) return;
+      
       // Extract timestamp (e.g., [00:05])
       const timestampMatch = line.match(/^\[(\d{2}):(\d{2})\]/);
       if (timestampMatch) {
@@ -100,13 +112,19 @@ export class ActionSynchronizer {
               if (match) actionContent = match[1];
             }
             
-            // Add action to queue with proper timing
-            actions.push({
-              type,
-              content: actionContent,
-              timestamp,
-              executed: false,
-            });
+            if (actionContent || type === 'draw') {
+              // Add action to queue with proper timing
+              actions.push({
+                type,
+                content: actionContent,
+                timestamp,
+                executed: false,
+              });
+              
+              if (this.debugMode) {
+                console.log(`Added action: ${type} - "${actionContent}" at ${timestamp}ms`);
+              }
+            }
           });
           
           // Add speech without the actions
@@ -137,6 +155,10 @@ export class ActionSynchronizer {
       }
     });
 
+    if (this.debugMode) {
+      console.log(`Parsed ${actions.length} actions and ${speech.length} speech segments`);
+    }
+
     return { actions, speech };
   }
 
@@ -149,6 +171,10 @@ export class ActionSynchronizer {
     this.speech = parsed.speech;
     this.actionBuffer = [];
     this.processingAction = false;
+    
+    if (this.debugMode) {
+      console.log("Response loaded with actions:", this.actions);
+    }
   }
 
   /**
@@ -158,6 +184,11 @@ export class ActionSynchronizer {
     this.startTime = Date.now();
     this.isPlaying = true;
     this.lastActionTime = 0;
+    
+    if (this.debugMode) {
+      console.log("Starting action synchronization at", new Date(this.startTime).toISOString());
+    }
+    
     this.checkActions();
   }
 
@@ -165,6 +196,10 @@ export class ActionSynchronizer {
    * Stop the synchronized playback
    */
   stop(): void {
+    if (this.debugMode) {
+      console.log("Stopping action synchronization");
+    }
+    
     this.isPlaying = false;
     this.processingAction = false;
     this.actionBuffer = [];
@@ -174,6 +209,10 @@ export class ActionSynchronizer {
    * Reset the synchronizer
    */
   reset(): void {
+    if (this.debugMode) {
+      console.log("Resetting action synchronizer");
+    }
+    
     this.actions = [];
     this.speech = [];
     this.isPlaying = false;
@@ -188,10 +227,17 @@ export class ActionSynchronizer {
   notifyActionComplete(): void {
     this.processingAction = false;
     
+    if (this.debugMode) {
+      console.log("Action completed, processing next action");
+    }
+    
     // If we have buffered actions, process the next one
     if (this.actionBuffer.length > 0) {
       const nextAction = this.actionBuffer.shift();
       if (nextAction) {
+        if (this.debugMode) {
+          console.log("Processing buffered action:", nextAction);
+        }
         this.actionCallback(nextAction);
         this.processingAction = true;
       }
@@ -210,16 +256,23 @@ export class ActionSynchronizer {
     const currentTime = Date.now();
     const elapsedTime = currentTime - this.startTime;
 
+    if (this.debugMode) {
+      console.log(`Checking actions at elapsed time: ${elapsedTime}ms`);
+    }
+
     // Execute any actions that should have occurred by now
     let actionFound = false;
     
     // If we're already processing an action, don't start a new one
     if (this.processingAction) {
-      setTimeout(() => this.checkActions(), 100);
+      setTimeout(() => this.checkActions(), 250);
       return;
     }
     
-    for (const action of this.actions) {
+    // Sort actions by timestamp to ensure correct order
+    const sortedActions = [...this.actions].sort((a, b) => a.timestamp - b.timestamp);
+    
+    for (const action of sortedActions) {
       if (!action.executed && action.timestamp <= elapsedTime) {
         // Format action for the whiteboard component
         let actionText = '';
@@ -245,10 +298,18 @@ export class ActionSynchronizer {
         // Buffer the action if we're already processing one
         // or if it's too soon after the last action
         const timeSinceLastAction = elapsedTime - this.lastActionTime;
-        if (this.processingAction || (this.lastActionTime > 0 && timeSinceLastAction < 500)) {
+        const minActionSpacing = 800; // Minimum time between actions in ms
+        
+        if (this.processingAction || (this.lastActionTime > 0 && timeSinceLastAction < minActionSpacing)) {
+          if (this.debugMode) {
+            console.log(`Buffering action '${actionText}' (time since last: ${timeSinceLastAction}ms)`);
+          }
           this.actionBuffer.push(actionText);
         } else {
           // Trigger the action
+          if (this.debugMode) {
+            console.log(`Executing action '${actionText}' at ${elapsedTime}ms`);
+          }
           this.actionCallback(actionText);
           this.processingAction = true;
           this.lastActionTime = elapsedTime;
@@ -267,11 +328,15 @@ export class ActionSynchronizer {
     const allActionsProcessed = allActionsExecuted && this.actionBuffer.length === 0 && !this.processingAction;
     
     if (allActionsProcessed && this.actions.length > 0) {
+      if (this.debugMode) {
+        console.log("All actions completed");
+      }
       this.isPlaying = false;
       this.onComplete();
     } else if (this.isPlaying) {
-      // Schedule next check
-      setTimeout(() => this.checkActions(), actionFound ? 200 : 100);
+      // Schedule next check - more frequent checks if no action was found
+      const checkInterval = actionFound ? 500 : 250;
+      setTimeout(() => this.checkActions(), checkInterval);
     }
   }
 
@@ -298,6 +363,28 @@ export class ActionSynchronizer {
    */
   getRemainingActions(): Action[] {
     return this.actions.filter(action => !action.executed);
+  }
+  
+  /**
+   * Get progress information
+   */
+  getProgress(): { 
+    elapsedTime: number, 
+    totalActions: number, 
+    completedActions: number,
+    remainingActions: number
+  } {
+    const elapsedTime = this.isPlaying ? Date.now() - this.startTime : 0;
+    const totalActions = this.actions.length;
+    const completedActions = this.actions.filter(action => action.executed).length;
+    const remainingActions = totalActions - completedActions;
+    
+    return {
+      elapsedTime,
+      totalActions,
+      completedActions,
+      remainingActions
+    };
   }
 }
 

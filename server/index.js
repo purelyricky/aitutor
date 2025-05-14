@@ -35,13 +35,22 @@ const createTutorAssistant = (topic) => {
   }
   
   return new TutorAssistant(tutorInstructions, {
+    topic: topic, // Pass the topic to the tutor assistant
     speakFirstOpeningMessage: `Hello! I'll be your tutor for ${topic} today. Let me prepare a lesson for you!`,
     llmModel: "gpt-3.5-turbo",
     speechToTextModel: "openai/whisper-1",
     voiceModel: "openai/tts-1",
     voiceName: "nova",
+    // Add additional parameters to slow down speech slightly for better comprehension
+    voiceSettings: {
+      speed: 0.85, // Slightly slower than default
+      stability: 0.7,
+      similarity_boost: 0.8
+    }
   });
 };
+
+module.exports = { TutorAssistant };
 
 server.on("connection", (ws, req) => {
   const cid = req.headers["sec-websocket-key"];

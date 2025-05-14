@@ -1,3 +1,5 @@
+// Fix for WhiteboardPage.tsx to properly handle voice detection and interruption issues
+
 import React, { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import Whiteboard from '../components/Whiteboard';
@@ -25,6 +27,8 @@ const WhiteboardPage: React.FC = () => {
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [currentLesson, setCurrentLesson] = useState<string>('');
   const [aiSpeakingCooldown, setAiSpeakingCooldown] = useState(false);
+  const [lessonInProgress, setLessonInProgress] = useState(false);
+  const [debugMode] = useState(false); // Set to true to enable debug logging
   
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -35,22 +39,34 @@ const WhiteboardPage: React.FC = () => {
   const synchronizerRef = useRef<ActionSynchronizer | null>(null);
   const userSpeakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const aiResponseInProgressRef = useRef<boolean>(false);
+  const silenceDetectionDisabledRef = useRef<boolean>(false);
   
   // Action processing logic
   const handleActionComplete = () => {
-    setActionQueue((prev) => prev.slice(1));
+    if (debugMode) console.log("Action completed, removing from queue");
+    
+    setActionQueue((prev) => {
+      if (synchronizerRef.current && prev.length > 0) {
+        // Notify the synchronizer that the action is complete
+        synchronizerRef.current.notifyActionComplete();
+      }
+      return prev.slice(1);
+    });
   };
   
   // Initialize action synchronizer
   useEffect(() => {
     synchronizerRef.current = new ActionSynchronizer(
       (action: string) => {
+        if (debugMode) console.log("Adding action to queue:", action);
         setActionQueue((prev) => [...prev, action]);
       },
       () => {
-        console.log('All actions completed');
+        if (debugMode) console.log('All actions completed');
         aiResponseInProgressRef.current = false;
-      }
+        setLessonInProgress(false);
+      },
+      debugMode // Pass debug mode to synchronizer
     );
     
     return () => {
@@ -58,39 +74,71 @@ const WhiteboardPage: React.FC = () => {
         synchronizerRef.current.stop();
       }
     };
-  }, []);
+  }, [debugMode]);
   
   // Parse AI response and prepare for playback
   const prepareResponsePlayback = (response: string) => {
+    if (debugMode) console.log("Preparing response for playback:", response.substring(0, 100) + "...");
+    
     setCurrentLesson(response);
     aiResponseInProgressRef.current = true;
+    setLessonInProgress(true);
+    
+    // Disable voice detection while processing the response
+    silenceDetectionDisabledRef.current = true;
     
     // Add to transcript (for display purposes)
     const lines = response.split('\n');
-    const formattedLines = lines.map((line) => {
-      // Remove action tags for the transcript display
-      return line.replace(/(\{[^}]+\})/g, '');
-    });
+    const formattedLines = lines
+      .filter(line => line.trim()) // Remove empty lines
+      .map((line) => {
+        // Remove action tags and timestamps for the transcript display
+        return line
+          .replace(/\[(\d{2}):(\d{2})\]/g, '')
+          .replace(/(\{[^}]+\})/g, '')
+          .trim();
+      })
+      .filter(line => line); // Remove any lines that are now empty
     
-    setTranscript((prev) => [...prev, ...formattedLines.filter(line => line.trim())]);
+    setTranscript((prev) => [...prev, ...formattedLines]);
     
     // Parse for synchronized playback
     if (synchronizerRef.current) {
       synchronizerRef.current.loadResponse(response);
-      synchronizerRef.current.start();
+      
+      // Start synchronizer with a slight delay to allow audio to begin
+      setTimeout(() => {
+        if (synchronizerRef.current) {
+          synchronizerRef.current.start();
+          
+          // Re-enable voice detection after a suitable delay
+          setTimeout(() => {
+            silenceDetectionDisabledRef.current = false;
+          }, 5000); // 5 seconds should be enough for initial audio to start
+        }
+      }, 2000);
     }
   };
 
   // Set up audio playback from buffer queue
   const playNextAudioChunk = () => {
     if (!audioContextRef.current || audioBufferQueueRef.current.length === 0) {
-      setIsSpeaking(false);
-      setAiSpeakingCooldown(false);
+      if (isSpeaking) {
+        if (debugMode) console.log("Audio queue empty, stopping speaking");
+        setIsSpeaking(false);
+        
+        // Add cooldown to prevent immediate user interruption
+        setAiSpeakingCooldown(true);
+        setTimeout(() => {
+          setAiSpeakingCooldown(false);
+        }, 1000);
+      }
       return;
     }
     
+    // AI is speaking - disable user interruption during speech
     setIsSpeaking(true);
-    setAiSpeakingCooldown(true);
+    silenceDetectionDisabledRef.current = true;
     
     // Get next audio chunk
     const audioData = audioBufferQueueRef.current.shift();
@@ -108,15 +156,20 @@ const WhiteboardPage: React.FC = () => {
     // When this chunk ends, play the next one
     source.onended = () => {
       audioSourceRef.current = null;
+      
       if (audioBufferQueueRef.current.length > 0) {
+        // More audio to play
         playNextAudioChunk();
       } else {
+        // Done speaking
+        if (debugMode) console.log("AI finished speaking");
         setIsSpeaking(false);
         
-        // Add a cooldown period after AI stops speaking
+        // Re-enable voice detection with a cooldown period
         setTimeout(() => {
+          silenceDetectionDisabledRef.current = false;
           setAiSpeakingCooldown(false);
-        }, 1000); // 1 second cooldown
+        }, 1000);
       }
     };
     
@@ -133,7 +186,7 @@ const WhiteboardPage: React.FC = () => {
     wsRef.current.binaryType = 'arraybuffer';
     
     wsRef.current.onopen = () => {
-      console.log('WebSocket connection established');
+      if (debugMode) console.log('WebSocket connection established');
       setIsConnected(true);
     };
     
@@ -155,9 +208,10 @@ const WhiteboardPage: React.FC = () => {
         
         if (message === 'RDY') {
           // Ready to listen - server is ready to receive audio
-          console.log('Server is ready to listen');
+          if (debugMode) console.log('Server is ready to listen');
         } else if (message === 'CLR') {
           // Clear audio buffer request
+          if (debugMode) console.log('Clearing audio buffer');
           audioBufferQueueRef.current = [];
           if (audioSourceRef.current) {
             audioSourceRef.current.stop();
@@ -165,15 +219,20 @@ const WhiteboardPage: React.FC = () => {
           }
           setIsSpeaking(false);
           setAiSpeakingCooldown(false);
-        } else if (!message.startsWith('---')) {
+          silenceDetectionDisabledRef.current = false;
+        } else if (message.startsWith('---')) {
+          // System message - log but don't process
+          if (debugMode) console.log('System message:', message);
+        } else {
           // Regular message, parse for actions and transcript
+          if (debugMode) console.log('Received content from server, length:', message.length);
           prepareResponsePlayback(message);
         }
       }
     };
     
     wsRef.current.onclose = () => {
-      console.log('WebSocket connection closed');
+      if (debugMode) console.log('WebSocket connection closed');
       setIsConnected(false);
     };
     
@@ -210,7 +269,7 @@ const WhiteboardPage: React.FC = () => {
         clearTimeout(userSpeakingTimeoutRef.current);
       }
     };
-  }, [topicName]);
+  }, [topicName, debugMode]);
   
   // Start recording
   const startRecording = async () => {
@@ -235,11 +294,11 @@ const WhiteboardPage: React.FC = () => {
         
         // Set up improved voice activity detection
         // Higher silence threshold to reduce false positives
-        let silenceThreshold = 0.03; // Increased from 0.01
+        let silenceThreshold = 0.04; // Increased to reduce false positives
         let silenceFrames = 0;
-        let maxSilenceFrames = 50; // ~1 second of silence (increased from 30)
+        let maxSilenceFrames = 60; // ~1.2 seconds of silence (increased)
         let speakingFrames = 0;
-        let minSpeakingFrames = 10; // Require consistent detection before triggering
+        let minSpeakingFrames = 15; // Require consistent detection before triggering
         
         const checkSilence = () => {
           const analyser = audioContextRef.current!.createAnalyser();
@@ -250,6 +309,12 @@ const WhiteboardPage: React.FC = () => {
           const dataArray = new Uint8Array(bufferLength);
           
           const detectSilence = () => {
+            // Skip detection if explicitly disabled
+            if (silenceDetectionDisabledRef.current) {
+              requestAnimationFrame(detectSilence);
+              return;
+            }
+            
             analyser.getByteFrequencyData(dataArray);
             
             let sum = 0;
@@ -264,18 +329,26 @@ const WhiteboardPage: React.FC = () => {
               silenceFrames = 0;
               speakingFrames++;
               
-              if (speakingFrames >= minSpeakingFrames && !isUserSpeaking && !isSpeaking && !aiSpeakingCooldown && !aiResponseInProgressRef.current) {
-                // Only set user speaking if:
-                // 1. We have enough consecutive speaking frames
-                // 2. User isn't already marked as speaking
-                // 3. AI isn't currently speaking
-                // 4. We're not in the cooldown period after AI speaking
-                // 5. There's not an ongoing AI response being processed
+              // Only consider user speech if:
+              // 1. We have enough consecutive speaking frames
+              // 2. User isn't already marked as speaking
+              // 3. AI isn't currently speaking
+              // 4. We're not in the cooldown period after AI speaking
+              // 5. There's not an ongoing AI response being processed or lesson in progress
+              if (
+                speakingFrames >= minSpeakingFrames && 
+                !isUserSpeaking && 
+                !isSpeaking && 
+                !aiSpeakingCooldown && 
+                !aiResponseInProgressRef.current &&
+                !lessonInProgress
+              ) {
+                if (debugMode) console.log("User speech detected", average);
                 setIsUserSpeaking(true);
                 
                 // Send interrupt signal only if necessary
                 if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                  console.log("User speaking detected, sending INT signal");
+                  if (debugMode) console.log("Sending INT signal");
                   wsRef.current.send('INT'); // Interrupt signal
                 }
               }
@@ -286,6 +359,7 @@ const WhiteboardPage: React.FC = () => {
               
               // Only stop user speaking state after sustained silence
               if (silenceFrames > maxSilenceFrames && isUserSpeaking) {
+                if (debugMode) console.log("User silence detected");
                 setIsUserSpeaking(false);
                 
                 // Debounce: Wait before allowing another speech detection
@@ -295,10 +369,10 @@ const WhiteboardPage: React.FC = () => {
                 
                 userSpeakingTimeoutRef.current = setTimeout(() => {
                   if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                    console.log("End of speech detected, sending EOS signal");
+                    if (debugMode) console.log("Sending EOS signal");
                     wsRef.current.send('EOS'); // End of speech signal
                   }
-                }, 300); // Short delay to prevent rapid toggling
+                }, 500); // Slightly longer delay to ensure full message is sent
               }
             }
             
@@ -356,6 +430,9 @@ const WhiteboardPage: React.FC = () => {
             <p key={index}>{line}</p>
           ))}
           {isUserSpeaking && <p className="user-speaking-indicator">You are speaking...</p>}
+          {lessonInProgress && !isUserSpeaking && !isSpeaking && (
+            <p className="lesson-in-progress">Lesson in progress...</p>
+          )}
         </div>
       </div>
     </div>
