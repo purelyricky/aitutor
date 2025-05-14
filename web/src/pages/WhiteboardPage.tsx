@@ -24,6 +24,7 @@ const WhiteboardPage: React.FC = () => {
   const [transcript, setTranscript] = useState<string[]>([]);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [currentLesson, setCurrentLesson] = useState<string>('');
+  const [aiSpeakingCooldown, setAiSpeakingCooldown] = useState(false);
   
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -32,6 +33,8 @@ const WhiteboardPage: React.FC = () => {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const synchronizerRef = useRef<ActionSynchronizer | null>(null);
+  const userSpeakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const aiResponseInProgressRef = useRef<boolean>(false);
   
   // Action processing logic
   const handleActionComplete = () => {
@@ -46,13 +49,21 @@ const WhiteboardPage: React.FC = () => {
       },
       () => {
         console.log('All actions completed');
+        aiResponseInProgressRef.current = false;
       }
     );
+    
+    return () => {
+      if (synchronizerRef.current) {
+        synchronizerRef.current.stop();
+      }
+    };
   }, []);
   
   // Parse AI response and prepare for playback
   const prepareResponsePlayback = (response: string) => {
     setCurrentLesson(response);
+    aiResponseInProgressRef.current = true;
     
     // Add to transcript (for display purposes)
     const lines = response.split('\n');
@@ -74,10 +85,12 @@ const WhiteboardPage: React.FC = () => {
   const playNextAudioChunk = () => {
     if (!audioContextRef.current || audioBufferQueueRef.current.length === 0) {
       setIsSpeaking(false);
+      setAiSpeakingCooldown(false);
       return;
     }
     
     setIsSpeaking(true);
+    setAiSpeakingCooldown(true);
     
     // Get next audio chunk
     const audioData = audioBufferQueueRef.current.shift();
@@ -99,6 +112,11 @@ const WhiteboardPage: React.FC = () => {
         playNextAudioChunk();
       } else {
         setIsSpeaking(false);
+        
+        // Add a cooldown period after AI stops speaking
+        setTimeout(() => {
+          setAiSpeakingCooldown(false);
+        }, 1000); // 1 second cooldown
       }
     };
     
@@ -136,8 +154,8 @@ const WhiteboardPage: React.FC = () => {
         const message = event.data.toString();
         
         if (message === 'RDY') {
-          // Ready to listen
-          // Do nothing special here
+          // Ready to listen - server is ready to receive audio
+          console.log('Server is ready to listen');
         } else if (message === 'CLR') {
           // Clear audio buffer request
           audioBufferQueueRef.current = [];
@@ -146,6 +164,7 @@ const WhiteboardPage: React.FC = () => {
             audioSourceRef.current = null;
           }
           setIsSpeaking(false);
+          setAiSpeakingCooldown(false);
         } else if (!message.startsWith('---')) {
           // Regular message, parse for actions and transcript
           prepareResponsePlayback(message);
@@ -186,6 +205,10 @@ const WhiteboardPage: React.FC = () => {
       if (synchronizerRef.current) {
         synchronizerRef.current.stop();
       }
+      
+      if (userSpeakingTimeoutRef.current) {
+        clearTimeout(userSpeakingTimeoutRef.current);
+      }
     };
   }, [topicName]);
   
@@ -210,11 +233,13 @@ const WhiteboardPage: React.FC = () => {
         source.connect(processorRef.current);
         processorRef.current.connect(audioContextRef.current.destination);
         
-        // Set up voice activity detection
-        // This is simplified, in a real app you'd use a proper VAD library
-        let silenceThreshold = 0.01;
+        // Set up improved voice activity detection
+        // Higher silence threshold to reduce false positives
+        let silenceThreshold = 0.03; // Increased from 0.01
         let silenceFrames = 0;
-        let maxSilenceFrames = 30; // ~0.6 seconds of silence
+        let maxSilenceFrames = 50; // ~1 second of silence (increased from 30)
+        let speakingFrames = 0;
+        let minSpeakingFrames = 10; // Require consistent detection before triggering
         
         const checkSilence = () => {
           const analyser = audioContextRef.current!.createAnalyser();
@@ -235,24 +260,45 @@ const WhiteboardPage: React.FC = () => {
             const average = sum / bufferLength / 255;
             
             if (average > silenceThreshold) {
-              // User is speaking
+              // Potential speech detected
               silenceFrames = 0;
-              if (!isUserSpeaking) {
+              speakingFrames++;
+              
+              if (speakingFrames >= minSpeakingFrames && !isUserSpeaking && !isSpeaking && !aiSpeakingCooldown && !aiResponseInProgressRef.current) {
+                // Only set user speaking if:
+                // 1. We have enough consecutive speaking frames
+                // 2. User isn't already marked as speaking
+                // 3. AI isn't currently speaking
+                // 4. We're not in the cooldown period after AI speaking
+                // 5. There's not an ongoing AI response being processed
                 setIsUserSpeaking(true);
-                // Send start of speech signal
+                
+                // Send interrupt signal only if necessary
                 if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                  console.log("User speaking detected, sending INT signal");
                   wsRef.current.send('INT'); // Interrupt signal
                 }
               }
             } else {
               // Silence detected
+              speakingFrames = 0;
               silenceFrames++;
+              
+              // Only stop user speaking state after sustained silence
               if (silenceFrames > maxSilenceFrames && isUserSpeaking) {
                 setIsUserSpeaking(false);
-                // Send end of speech signal
-                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                  wsRef.current.send('EOS'); // End of speech signal
+                
+                // Debounce: Wait before allowing another speech detection
+                if (userSpeakingTimeoutRef.current) {
+                  clearTimeout(userSpeakingTimeoutRef.current);
                 }
+                
+                userSpeakingTimeoutRef.current = setTimeout(() => {
+                  if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    console.log("End of speech detected, sending EOS signal");
+                    wsRef.current.send('EOS'); // End of speech signal
+                  }
+                }, 300); // Short delay to prevent rapid toggling
               }
             }
             

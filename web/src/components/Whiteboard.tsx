@@ -52,6 +52,8 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
   const [currentTextIndex, setCurrentTextIndex] = useState(0);
   const [currentText, setCurrentText] = useState("");
   const [scale, setScale] = useState(1);
+  const currentActionRef = useRef<string | null>(null);
+  const animationRef = useRef<number | null>(null);
 
   // Initialize canvas
   useEffect(() => {
@@ -71,10 +73,28 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
       context.fillStyle = "white";
       context.fillRect(0, 0, canvas.width, canvas.height);
     }
+    
+    // Handle window resize
+    const handleResize = () => {
+      if (canvas && containerRef.current) {
+        canvas.width = containerRef.current.clientWidth;
+        canvas.height = containerRef.current.clientHeight;
+        redrawCanvas();
+      }
+    };
+    
+    window.addEventListener('resize', handleResize);
+    
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
   }, []);
 
-  // Redraw canvas when state changes
-  useEffect(() => {
+  // Redraw canvas function to avoid code duplication
+  const redrawCanvas = () => {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     
@@ -185,12 +205,18 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
         context.fillText(text.content, text.x, text.y);
       });
     }
+  };
+
+  // Redraw canvas when state changes
+  useEffect(() => {
+    redrawCanvas();
   }, [state, scale]);
 
   // Process the next action in the queue
   useEffect(() => {
-    if (actionQueue.length > 0 && !writing) {
+    if (actionQueue.length > 0 && !writing && !currentActionRef.current) {
       const action = actionQueue[0];
+      currentActionRef.current = action;
       
       // Parse and execute action
       if (action.startsWith("{write:")) {
@@ -202,43 +228,64 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
           
           // Calculate writing speed based on text length
           // Longer text should write faster to keep pace with speech
-          const writingSpeed = Math.max(10, Math.min(80, 200 / text.length));
+          const writingSpeed = Math.max(10, Math.min(70, 150 / text.length));
           
           // Animate writing text character by character
           let index = 0;
-          const writeInterval = setInterval(() => {
+          const writeChar = () => {
             if (index < text.length) {
               setCurrentText(text.substring(0, index + 1));
               index++;
+              setTimeout(writeChar, writingSpeed);
             } else {
-              clearInterval(writeInterval);
-              
               // Add text to state
-              setState((prev) => ({
-                ...prev,
-                texts: [
-                  ...prev.texts,
-                  {
-                    content: text,
-                    x: 50 + position.x,
-                    y: 50 + position.y + prev.texts.length * 40,
-                    color: "#000000",
-                    highlighted: false,
-                  },
-                ],
-              }));
+              setState((prev) => {
+                // Find suitable Y position that doesn't overlap
+                let yPos = 50 + position.y;
+                
+                // Adjust position for new line if needed (basic word wrapping)
+                const textLength = text.length * 12; // Rough estimate of text width
+                const canvasWidth = canvasRef.current?.width || 800;
+                
+                if (50 + position.x + textLength > canvasWidth) {
+                  // Move to next line if text would go off screen
+                  yPos += 40;
+                  setPosition((prev) => ({
+                    x: 0,
+                    y: prev.y + 40,
+                  }));
+                }
+                
+                return {
+                  ...prev,
+                  texts: [
+                    ...prev.texts,
+                    {
+                      content: text,
+                      x: 50 + position.x,
+                      y: yPos,
+                      color: "#000000",
+                      highlighted: false,
+                    },
+                  ],
+                };
+              });
               
-              // Update position for next text
+              // Update position for next text (move right a bit)
               setPosition((prev) => ({
-                ...prev,
-                y: prev.y + 40,
+                x: prev.x + Math.min(text.length * 6, 200), // Move right, but not too far
+                y: prev.y,
               }));
               
               setWriting(false);
               setCurrentText("");
+              currentActionRef.current = null;
               onActionComplete();
             }
-          }, writingSpeed); // Adaptive speed of writing
+          };
+          
+          // Start writing animation
+          writeChar();
         }
       } else if (action.startsWith("{draw:")) {
         // Extract shape from {draw:shape} format
@@ -246,41 +293,66 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
         if (match && match[1]) {
           const shapeType = match[1] as "rectangle" | "circle" | "arrow" | "line";
           
-          // Add shape to state
-          setState((prev) => {
-            const newShape: Shape = {
-              type: shapeType,
-              x: 100 + position.x,
-              y: 100 + position.y,
-              color: "#000000",
-            };
-            
-            // Set additional properties based on shape type
-            switch (shapeType) {
-              case "rectangle":
-                newShape.width = 150;
-                newShape.height = 100;
-                break;
-              case "circle":
-                newShape.radius = 50;
-                break;
-              case "line":
-                newShape.endX = 250 + position.x;
-                newShape.endY = 100 + position.y;
-                break;
-              case "arrow":
-                newShape.endX = 250 + position.x;
-                newShape.endY = 100 + position.y;
-                break;
-            }
-            
-            return {
-              ...prev,
-              shapes: [...prev.shapes, newShape],
-            };
-          });
+          // Add shape to state with animation
+          let progress = 0;
+          const totalFrames = 40; // Animation frames
           
-          onActionComplete();
+          const animateShape = () => {
+            if (progress < totalFrames) {
+              progress++;
+              const completionRatio = progress / totalFrames;
+              
+              setState((prev) => {
+                const newShapes = [...prev.shapes];
+                // Remove the previous animation frame
+                if (newShapes.length > 0 && progress > 1) {
+                  newShapes.pop();
+                }
+                
+                // Create the shape with current animation progress
+                const newShape: Shape = {
+                  type: shapeType,
+                  x: 100 + position.x,
+                  y: 100 + position.y,
+                  color: "#000000",
+                };
+                
+                // Set additional properties based on shape type and animation progress
+                switch (shapeType) {
+                  case "rectangle":
+                    newShape.width = 150 * completionRatio;
+                    newShape.height = 100 * completionRatio;
+                    break;
+                  case "circle":
+                    newShape.radius = 50 * completionRatio;
+                    break;
+                  case "line":
+                    newShape.endX = 100 + position.x + 150 * completionRatio;
+                    newShape.endY = 100 + position.y;
+                    break;
+                  case "arrow":
+                    newShape.endX = 100 + position.x + 150 * completionRatio;
+                    newShape.endY = 100 + position.y;
+                    break;
+                }
+                
+                return {
+                  ...prev,
+                  shapes: [...newShapes, newShape],
+                };
+              });
+              
+              animationRef.current = requestAnimationFrame(animateShape);
+            } else {
+              // Animation complete
+              // Final shape is already in the state
+              currentActionRef.current = null;
+              onActionComplete();
+            }
+          };
+          
+          // Start animation
+          animateShape();
         }
       } else if (action.startsWith("{highlight:")) {
         // Extract text from {highlight: "text"} format
@@ -288,7 +360,7 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
         if (match && match[1]) {
           const textToHighlight = match[1];
           
-          // Find and highlight text
+          // Find and highlight text with animation
           setState((prev) => {
             const newTexts = prev.texts.map((text) => {
               if (text.content.includes(textToHighlight)) {
@@ -303,7 +375,7 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
             };
           });
           
-          // Remove highlight after 2 seconds
+          // Remove highlight after 3 seconds
           setTimeout(() => {
             setState((prev) => {
               const newTexts = prev.texts.map((text) => ({
@@ -316,23 +388,160 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
                 texts: newTexts,
               };
             });
-          }, 2000);
-          
+            
+            currentActionRef.current = null;
+            onActionComplete();
+          }, 3000);
+        } else {
+          currentActionRef.current = null;
           onActionComplete();
         }
       } else if (action.startsWith("{erase:")) {
-        // Just complete the action for now
-        onActionComplete();
+        // Extract area from {erase: "area"} format
+        const match = action.match(/{erase:\s*"([^"]*)"}/);
+        if (match && match[1]) {
+          const areaToErase = match[1].toLowerCase();
+          
+          // Simulate eraser motion
+          let eraserX = 100;
+          let eraserY = 100;
+          const targetX = 700;
+          
+          const animateEraser = () => {
+            // Move eraser
+            eraserX += 15;
+            
+            // Update canvas to show eraser effect
+            const canvas = canvasRef.current;
+            const context = canvas?.getContext("2d");
+            
+            if (canvas && context) {
+              // Redraw everything
+              redrawCanvas();
+              
+              // Draw eraser indicator
+              context.fillStyle = "#f0f0f0aa";
+              context.fillRect(eraserX - 25, eraserY - 25, 50, 50);
+              context.strokeStyle = "#aaaaaa";
+              context.strokeRect(eraserX - 25, eraserY - 25, 50, 50);
+            }
+            
+            if (eraserX < targetX) {
+              animationRef.current = requestAnimationFrame(animateEraser);
+            } else {
+              // Erasing complete, actually remove content
+              if (areaToErase.includes("all")) {
+                // Erase everything
+                setState((prev) => ({
+                  ...prev,
+                  texts: [],
+                  shapes: [],
+                }));
+                setPosition({ x: 0, y: 0 });
+              } else if (areaToErase.includes("text")) {
+                // Erase just text
+                setState((prev) => ({
+                  ...prev,
+                  texts: [],
+                }));
+              } else if (areaToErase.includes("shape")) {
+                // Erase just shapes
+                setState((prev) => ({
+                  ...prev,
+                  shapes: [],
+                }));
+              }
+              
+              // Complete the action
+              currentActionRef.current = null;
+              onActionComplete();
+            }
+          };
+          
+          // Start animation
+          animateEraser();
+        } else {
+          currentActionRef.current = null;
+          onActionComplete();
+        }
       } else if (action.startsWith("{newpage:")) {
-        // Clear whiteboard for new page
-        setState((prev) => ({
-          texts: [],
-          shapes: [],
-          currentPage: prev.currentPage + 1,
-          totalPages: prev.totalPages + 1,
-        }));
-        
-        setPosition({ x: 0, y: 0 });
+        // Extract title from {newpage: "title"} format
+        const match = action.match(/{newpage:\s*"([^"]*)"}/);
+        if (match && match[1]) {
+          const pageTitle = match[1];
+          
+          // Animate page flip
+          let progress = 0;
+          const totalFrames = 20;
+          
+          const animatePageFlip = () => {
+            progress++;
+            const canvas = canvasRef.current;
+            const context = canvas?.getContext("2d");
+            
+            if (canvas && context) {
+              // Draw page flip effect
+              context.fillStyle = "white";
+              context.fillRect(0, 0, canvas.width, canvas.height);
+              
+              context.fillStyle = "#f0f0f0";
+              const flipWidth = (canvas.width * progress) / totalFrames;
+              context.fillRect(0, 0, flipWidth, canvas.height);
+              
+              if (progress === totalFrames / 2) {
+                // Clear whiteboard for new page
+                setState((prev) => ({
+                  texts: [],
+                  shapes: [],
+                  currentPage: prev.currentPage + 1,
+                  totalPages: prev.totalPages + 1,
+                }));
+                setPosition({ x: 0, y: 0 });
+              }
+              
+              if (progress < totalFrames) {
+                requestAnimationFrame(animatePageFlip);
+              } else {
+                // Add page title
+                setState((prev) => ({
+                  ...prev,
+                  texts: [
+                    {
+                      content: pageTitle,
+                      x: 50,
+                      y: 50,
+                      color: "#3498db",
+                      highlighted: false,
+                    },
+                  ],
+                }));
+                
+                setPosition({ x: 0, y: 50 });
+                
+                currentActionRef.current = null;
+                onActionComplete();
+              }
+            }
+          };
+          
+          // Start animation
+          animatePageFlip();
+        } else {
+          // Clear whiteboard for new page without title
+          setState((prev) => ({
+            texts: [],
+            shapes: [],
+            currentPage: prev.currentPage + 1,
+            totalPages: prev.totalPages + 1,
+          }));
+          
+          setPosition({ x: 0, y: 0 });
+          currentActionRef.current = null;
+          onActionComplete();
+        }
+      } else {
+        // Unknown action type, just complete it
+        currentActionRef.current = null;
         onActionComplete();
       }
     }
@@ -386,7 +595,7 @@ const Whiteboard: React.FC<WhiteboardProps> = ({
             style={{ 
               position: "absolute",
               left: `${50 + position.x}px`,
-              top: `${50 + position.y + state.texts.length * 40 - 24}px`,
+              top: `${50 + position.y - 24}px`,
               fontFamily: "'Handlee', cursive",
               fontSize: "24px",
             }}

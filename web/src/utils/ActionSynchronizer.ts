@@ -32,6 +32,9 @@ export class ActionSynchronizer {
   private isPlaying: boolean = false;
   private actionCallback: (action: string) => void;
   private onComplete: () => void;
+  private processingAction: boolean = false;
+  private lastActionTime: number = 0;
+  private actionBuffer: string[] = [];
 
   constructor(
     actionCallback: (action: string) => void,
@@ -97,7 +100,7 @@ export class ActionSynchronizer {
               if (match) actionContent = match[1];
             }
             
-            // Add action to queue
+            // Add action to queue with proper timing
             actions.push({
               type,
               content: actionContent,
@@ -144,6 +147,8 @@ export class ActionSynchronizer {
     const parsed = this.parseResponse(response);
     this.actions = parsed.actions;
     this.speech = parsed.speech;
+    this.actionBuffer = [];
+    this.processingAction = false;
   }
 
   /**
@@ -152,6 +157,7 @@ export class ActionSynchronizer {
   start(): void {
     this.startTime = Date.now();
     this.isPlaying = true;
+    this.lastActionTime = 0;
     this.checkActions();
   }
 
@@ -160,6 +166,8 @@ export class ActionSynchronizer {
    */
   stop(): void {
     this.isPlaying = false;
+    this.processingAction = false;
+    this.actionBuffer = [];
   }
 
   /**
@@ -169,6 +177,28 @@ export class ActionSynchronizer {
     this.actions = [];
     this.speech = [];
     this.isPlaying = false;
+    this.processingAction = false;
+    this.actionBuffer = [];
+  }
+
+  /**
+   * Notify that an action has been completed
+   * This allows the next action to be processed
+   */
+  notifyActionComplete(): void {
+    this.processingAction = false;
+    
+    // If we have buffered actions, process the next one
+    if (this.actionBuffer.length > 0) {
+      const nextAction = this.actionBuffer.shift();
+      if (nextAction) {
+        this.actionCallback(nextAction);
+        this.processingAction = true;
+      }
+    } else {
+      // Check for new actions
+      this.checkActions();
+    }
   }
 
   /**
@@ -181,7 +211,13 @@ export class ActionSynchronizer {
     const elapsedTime = currentTime - this.startTime;
 
     // Execute any actions that should have occurred by now
-    let actionTriggered = false;
+    let actionFound = false;
+    
+    // If we're already processing an action, don't start a new one
+    if (this.processingAction) {
+      setTimeout(() => this.checkActions(), 100);
+      return;
+    }
     
     for (const action of this.actions) {
       if (!action.executed && action.timestamp <= elapsedTime) {
@@ -206,10 +242,20 @@ export class ActionSynchronizer {
             break;
         }
         
-        // Trigger the action
-        this.actionCallback(actionText);
+        // Buffer the action if we're already processing one
+        // or if it's too soon after the last action
+        const timeSinceLastAction = elapsedTime - this.lastActionTime;
+        if (this.processingAction || (this.lastActionTime > 0 && timeSinceLastAction < 500)) {
+          this.actionBuffer.push(actionText);
+        } else {
+          // Trigger the action
+          this.actionCallback(actionText);
+          this.processingAction = true;
+          this.lastActionTime = elapsedTime;
+        }
+        
         action.executed = true;
-        actionTriggered = true;
+        actionFound = true;
         
         // Only execute one action at a time
         break;
@@ -218,13 +264,14 @@ export class ActionSynchronizer {
 
     // Check if all actions have been executed
     const allActionsExecuted = this.actions.every(action => action.executed);
+    const allActionsProcessed = allActionsExecuted && this.actionBuffer.length === 0 && !this.processingAction;
     
-    if (allActionsExecuted && this.actions.length > 0) {
+    if (allActionsProcessed && this.actions.length > 0) {
       this.isPlaying = false;
       this.onComplete();
     } else if (this.isPlaying) {
       // Schedule next check
-      setTimeout(() => this.checkActions(), actionTriggered ? 500 : 100);
+      setTimeout(() => this.checkActions(), actionFound ? 200 : 100);
     }
   }
 
